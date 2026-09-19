@@ -1,0 +1,194 @@
+name: Docker Publish (Custom)
+
+# Fork-local image publish. Produces the shell-equipped Debian variant
+# (`debian:bookworm-slim`) with the spec-generated dist feature selection plus the
+# Mattermost and Slack channels appended, then pushes a multi-arch image to GHCR
+# under this fork. Manual-only: no tag, schedule, or push trigger.
+#
+# Shape mirrors upstream `release-stable-manual.yml`: the Rust workspace is
+# compiled in ordinary jobs (cached across runs by Swatinem/rust-cache), never
+# inside the image. x86_64 builds natively on ubuntu-22.04; aarch64 is
+# cross-compiled on the same amd64 runner with the gcc-aarch64-linux-gnu
+# toolchain. The binaries are then packaged with Dockerfile.ci, whose
+# `ARG TARGETARCH` selects the matching `bin/<arch>` tree — so the image build
+# does no compilation and needs no QEMU for either architecture.
+#
+# ubuntu-22.04 is deliberate: it links glibc 2.35, which is <= the 2.36 shipped by
+# the bookworm-slim runtime base. A newer build host would produce binaries that
+# fail to start in the image (#3573).
+#
+# The feature list comes from `cargo generate features --selection dist --target
+# <triple>`, the same canonical resolver install.sh and the packaging surfaces
+# consume, so the image cannot drift from the dist policy. The two extra channels
+# are appended at build time, which touches no generated file and keeps the
+# `installer-drift` gate green.
+#
+# The upstream `docker-publish.yml` matrix and all other automatic workflows are
+# left untouched by this file; they are disabled at the repository level instead
+# (Settings -> Actions), which keeps `tests/architecture/*` and upstream merges
+# intact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Floating image tag to publish (also pushed as :latest)"
+        required: true
+        default: "debian"
+        type: string
+
+concurrency:
+  group: docker-publish-custom-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+  EXTRA_FEATURES: channel-mattermost,channel-slack
+
+jobs:
+  web:
+    name: Build web dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web dashboard
+        # `cargo web build` is the xtask wrapper that renders the gateway's
+        # OpenAPI spec and runs openapi-typescript before `npm ci` + `npm run
+        # build`. A plain `cd web && npm run build` skips that and fails tsc on
+        # the missing generated import.
+        run: cargo web build
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
+  binaries:
+    name: Build ${{ matrix.target }}
+    needs: [web]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+            cross_compiler: "gcc-aarch64-linux-gnu g++-aarch64-linux-gnu"
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+            linker: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: 1.98.0
+          targets: ${{ matrix.target }}
+      # Per-target prefix so the two legs keep independent caches.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: ${{ matrix.target }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: web-dist
+          path: web/dist/
+      - name: Install cross compiler
+        if: matrix.cross_compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ${{ matrix.cross_compiler }}
+      - name: Build binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
+            export "${{ matrix.linker_env }}=${{ matrix.linker }}"
+          fi
+          # Canonical per-target dist feature list, then the two extra channels.
+          FEATURES="$(cargo run --quiet -p xtask --bin generate -- features --selection dist --target "${{ matrix.target }}")"
+          FEATURES="${FEATURES},${EXTRA_FEATURES}"
+          echo "Resolved features: $FEATURES"
+          cargo build --release --locked --no-default-features --features "${FEATURES}" --target ${{ matrix.target }}
+          cargo build --release --locked -p zerocode --target ${{ matrix.target }}
+      - name: Check binary size
+        shell: bash
+        run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/zeroclaw" "${{ matrix.target }}"
+        env:
+          BINARY_SIZE_HARD_LIMIT: "67108864" # 64MB cap, matching the upstream release gate
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p staging/web
+          cp "target/${{ matrix.target }}/release/zeroclaw" staging/
+          cp "target/${{ matrix.target }}/release/zerocode" staging/
+          cp -r web/dist staging/web/dist
+          cd staging
+          tar czf "../zeroclaw-${{ matrix.target }}.tar.gz" zeroclaw zerocode web/dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zeroclaw-${{ matrix.target }}
+          path: zeroclaw-${{ matrix.target }}.tar.gz
+          retention-days: 1
+
+  docker:
+    name: Publish ${{ github.event.inputs.tag }}
+    needs: [binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # Both tarballs land flat in artifacts/ as
+      # zeroclaw-<target>.tar.gz, which is the layout
+      # scripts/ci/prepare_docker_context.sh expects.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: zeroclaw-x86_64-unknown-linux-gnu
+          path: artifacts/
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: zeroclaw-aarch64-unknown-linux-gnu
+          path: artifacts/
+      - name: Prepare docker build context
+        # Unpacks each tarball into docker-ctx/bin/<arch>, verifies the binaries
+        # and dashboard are present, writes the runtime config, and installs
+        # Dockerfile.ci as docker-ctx/Dockerfile.
+        run: bash scripts/ci/prepare_docker_context.sh from-artifacts docker-ctx artifacts
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@1dc73863535b631f98b2378be8619f83b136f4a0 # v6.18.0
+        with:
+          context: docker-ctx
+          file: docker-ctx/Dockerfile
+          build-args: |
+            VARIANT=debian
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ github.event.inputs.tag }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}:latest
+          cache-from: type=gha,scope=docker-custom-dist
+          cache-to: type=gha,scope=docker-custom-dist,mode=max,ignore-error=true
+      - name: Inspect published manifest
+        run: docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ github.event.inputs.tag }}"
