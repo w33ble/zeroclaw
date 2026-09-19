@@ -7,8 +7,6 @@ on:
       - ".github/workflows/platform-tests.yml"
       - "crates/zeroclaw-tools/src/coding_cli.rs"
   workflow_dispatch:
-  schedule:
-    - cron: "17 3 * * *"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
