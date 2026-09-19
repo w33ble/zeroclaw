@@ -1,9 +1,9 @@
-# Static analysis — fast Semgrep pattern checks on every PR and master push.
+# Static analysis — fast Semgrep pattern checks on every PR.
 #
 # Semgrep: fast pattern scan (injection / path-traversal / unsafe patterns, plus
 #   config-layer surfaces CodeQL does not cover — GitHub Actions YAML, Dockerfiles,
 #   shell, HTML). On PRs it runs diff-aware (--baseline-commit) so only findings the
-#   branch introduces are reported; on master push it does a full scan. Results upload
+#   branch introduces are reported. Results upload
 #   as SARIF to the GitHub Security tab. Report-only (no --error) — surfaced, never
 #   gating. .semgrepignore suppresses known false-positive surfaces (tests, examples,
 #   docs theme).
@@ -17,8 +17,6 @@ name: Code Analysis
 
 on:
   pull_request:
-    branches: [master]
-  push:
     branches: [master]
 
 concurrency:
